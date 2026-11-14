@@ -21,9 +21,7 @@ public struct WorkoutLibraryView: View {
                     .ignoresSafeArea()
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        headerBanner
-
+                    VStack(alignment: .leading, spacing: 14) {
                         if store.workouts.isEmpty {
                             emptyStateView
                         } else {
@@ -51,33 +49,7 @@ public struct WorkoutLibraryView: View {
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
-                    .padding(.bottom, 100)
-                }
-
-                // Bottom Floating "+ New Workout" Button
-                VStack {
-                    Spacer()
-                    Button {
-                        let newDraft = store.makeNewDraftWorkout()
-                        editorContext = EditorSheetContext(workout: newDraft, isNew: true)
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 17, weight: .bold))
-                            Text("New Workout")
-                                .font(.system(size: 17, weight: .bold, design: .rounded))
-                        }
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 26)
-                        .padding(.vertical, 16)
-                        .background(
-                            Capsule()
-                                .fill(Color(red: 1.0, green: 0.84, blue: 0.15))
-                                .shadow(color: Color.black.opacity(0.45), radius: 12, x: 0, y: 6)
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.bottom, 16)
+                    .padding(.bottom, 32)
                 }
             }
             .navigationTitle("PulseCoach")
@@ -87,10 +59,11 @@ public struct WorkoutLibraryView: View {
                         let newDraft = store.makeNewDraftWorkout()
                         editorContext = EditorSheetContext(workout: newDraft, isNew: true)
                     } label: {
-                        Label("New Workout", systemImage: "plus.circle.fill")
-                            .font(.headline)
-                            .foregroundStyle(Color(red: 1.0, green: 0.84, blue: 0.15))
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 24, weight: .bold))
+                            .foregroundStyle(.white)
                     }
+                    .accessibilityLabel("New Workout")
                 }
             }
             .sheet(item: $editorContext) { context in
@@ -130,35 +103,6 @@ public struct WorkoutLibraryView: View {
         .preferredColorScheme(.dark)
     }
 
-    private var headerBanner: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(Color(red: 1.0, green: 0.23, blue: 0.19).opacity(0.2))
-                    .frame(width: 44, height: 44)
-                Image(systemName: "timer")
-                    .font(.system(size: 20, weight: .bold))
-                    .foregroundStyle(Color(red: 1.0, green: 0.23, blue: 0.19))
-            }
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Trainer Interval Presets")
-                    .font(.system(size: 16, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                Text("Spotify-friendly cues • Background lock-screen ready")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.6))
-            }
-
-            Spacer()
-        }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.white.opacity(0.05))
-        )
-    }
-
     private var emptyStateView: some View {
         VStack(spacing: 14) {
             Image(systemName: "figure.highintensity.intervaltraining")
@@ -166,10 +110,10 @@ public struct WorkoutLibraryView: View {
                 .foregroundStyle(.white.opacity(0.4))
 
             Text("No Saved Workouts")
-                .font(.system(size: 20, weight: .bold, design: .rounded))
+                .font(.system(size: 20, weight: .bold, design: .default))
                 .foregroundStyle(.white)
 
-            Text("Tap \"+ New Workout\" below to create your first custom interval timer.")
+            Text("Tap the \"+\" button in the top-right corner to create your first custom interval timer.")
                 .font(.subheadline)
                 .foregroundStyle(.white.opacity(0.6))
                 .multilineTextAlignment(.center)

@@ -13,11 +13,15 @@ public final class LiveActivityManager {
         workoutName: String,
         state: PulseCoachActivityAttributes.ContentState
     ) {
-        endAllActivitiesImmediate()
-
-        // Safely guard when sideloaded with a free Apple ID where Live Activities or PlugIns may not be provisioned
         guard ActivityAuthorizationInfo().areActivitiesEnabled else {
             return
+        }
+
+        // End any lingering activities before requesting a fresh one
+        for existing in Activity<PulseCoachActivityAttributes>.activities {
+            Task {
+                await existing.end(nil, dismissalPolicy: .immediate)
+            }
         }
 
         let attributes = PulseCoachActivityAttributes(workoutName: workoutName)
@@ -30,40 +34,53 @@ public final class LiveActivityManager {
                 pushType: nil
             )
         } catch {
-            // Gracefully ignore if Widget Extension wasn't provisioned during sideloading
             currentActivity = nil
             print("[LiveActivityManager] Live Activity unavailable (safe fallback): \(error.localizedDescription)")
         }
     }
 
     public func updateActivity(with state: PulseCoachActivityAttributes.ContentState) {
-        guard let activity = currentActivity else { return }
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
+
         let content = ActivityContent(state: state, staleDate: nil)
-        Task {
-            await activity.update(content)
+        let activities = Activity<PulseCoachActivityAttributes>.activities
+        let targetActivities: [Activity<PulseCoachActivityAttributes>]
+        if !activities.isEmpty {
+            targetActivities = activities
+        } else if let currentActivity {
+            targetActivities = [currentActivity]
+        } else {
+            return
         }
-    }
 
-    public func endActivity(finalState: PulseCoachActivityAttributes.ContentState? = nil) {
-        guard let activity = currentActivity else { return }
-        currentActivity = nil
-
-        Task {
-            if let finalState {
-                let content = ActivityContent(state: finalState, staleDate: nil)
-                await activity.end(content, dismissalPolicy: .default)
-            } else {
-                await activity.end(nil, dismissalPolicy: .immediate)
+        for activity in targetActivities {
+            Task {
+                await activity.update(content)
             }
         }
     }
 
-    private func endAllActivitiesImmediate() {
+    public func endActivity(finalState: PulseCoachActivityAttributes.ContentState? = nil) {
+        let activities = Activity<PulseCoachActivityAttributes>.activities
+        let targetActivities: [Activity<PulseCoachActivityAttributes>]
+        if !activities.isEmpty {
+            targetActivities = activities
+        } else if let currentActivity {
+            targetActivities = [currentActivity]
+        } else {
+            currentActivity = nil
+            return
+        }
         currentActivity = nil
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
-        for activity in Activity<PulseCoachActivityAttributes>.activities {
+
+        for activity in targetActivities {
             Task {
-                await activity.end(nil, dismissalPolicy: .immediate)
+                if let finalState {
+                    let content = ActivityContent(state: finalState, staleDate: nil)
+                    await activity.end(content, dismissalPolicy: .default)
+                } else {
+                    await activity.end(nil, dismissalPolicy: .immediate)
+                }
             }
         }
     }

@@ -11,6 +11,7 @@ public final class AudioEngine: NSObject {
     private var activeCuePlayers: [AVAudioPlayer] = []
     private var duckRestoreTask: Task<Void, Never>?
     private var isWorkoutSessionActive: Bool = false
+    private var isCurrentlyDucking: Bool = false
     private var currentSpotifyBehavior: SpotifyAudioBehavior = .mix
 
     // Pre-cached synthesized WAV data for fallback SFX so playback has zero latency
@@ -28,12 +29,14 @@ public final class AudioEngine: NSObject {
     public func startWorkoutAudioSession(spotifyBehavior: SpotifyAudioBehavior) {
         currentSpotifyBehavior = spotifyBehavior
         isWorkoutSessionActive = true
-        configureAudioSession(duckingActive: false)
+        isCurrentlyDucking = false
+        configureMixAudioSession()
         startKeepAliveLoop()
     }
 
     public func stopWorkoutAudioSession() {
         isWorkoutSessionActive = false
+        isCurrentlyDucking = false
         duckRestoreTask?.cancel()
         duckRestoreTask = nil
 
@@ -56,43 +59,84 @@ public final class AudioEngine: NSObject {
         }
     }
 
-    private func configureAudioSession(duckingActive: Bool) {
+    private func configureMixAudioSession() {
         let session = AVAudioSession.sharedInstance()
         do {
-            let options: AVAudioSession.CategoryOptions = duckingActive ? [.duckOthers] : [.mixWithOthers]
-            try session.setCategory(.playback, mode: .default, options: options)
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
         } catch {
-            print("[AudioEngine] Failed to configure AVAudioSession: \(error.localizedDescription)")
+            print("[AudioEngine] Failed to configure mix AVAudioSession: \(error.localizedDescription)")
         }
     }
 
-    private func beginDuckingIfNeeded(estimatedDuration: TimeInterval) {
-        guard currentSpotifyBehavior == .duck else { return }
+    private func activateDuckingBeforeCue(fallbackDuration: TimeInterval) {
         duckRestoreTask?.cancel()
-        configureAudioSession(duckingActive: true)
+        duckRestoreTask = nil
 
-        duckRestoreTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64((estimatedDuration + 0.25) * 1_000_000_000))
-            guard let self, !Task.isCancelled else { return }
-            self.restoreMixSessionAfterDuck()
+        guard currentSpotifyBehavior == .duck else {
+            if !isWorkoutSessionActive {
+                configureMixAudioSession()
+            }
+            return
         }
-    }
 
-    private func restoreMixSessionAfterDuck() {
-        guard currentSpotifyBehavior == .duck else { return }
         let session = AVAudioSession.sharedInstance()
         do {
+            try session.setCategory(.playback, mode: .default, options: [.duckOthers])
+            try session.setActive(true)
+            isCurrentlyDucking = true
+        } catch {
+            print("[AudioEngine] Failed to activate ducking: \(error.localizedDescription)")
+        }
+
+        // Safety fallback timer in case delegate callback doesn't fire
+        scheduleDuckRestore(after: fallbackDuration + 0.35)
+    }
+
+    private func scheduleDuckRestore(after delaySeconds: TimeInterval) {
+        guard currentSpotifyBehavior == .duck else { return }
+        duckRestoreTask?.cancel()
+        duckRestoreTask = Task { @MainActor [weak self] in
+            let ns = UInt64(max(0.05, delaySeconds) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: ns)
+            guard let self, !Task.isCancelled else { return }
+            // Only unduck if no cue is still actively playing
+            let anyCueStillPlaying = self.activeCuePlayers.contains(where: { $0.isPlaying }) || self.speechSynthesizer.isSpeaking
+            if !anyCueStillPlaying {
+                self.restoreSpotifyAfterDuck()
+            }
+        }
+    }
+
+    private func restoreSpotifyAfterDuck() {
+        guard isCurrentlyDucking else { return }
+        isCurrentlyDucking = false
+
+        let session = AVAudioSession.sharedInstance()
+        do {
+            // 1. Briefly pause silent keep-alive player so setActive(false) succeeds cleanly
+            keepAlivePlayer?.pause()
+            activeCuePlayers.removeAll { !$0.isPlaying }
+
+            // 2. Deactivate with .notifyOthersOnDeactivation so Spotify immediately returns to 100% volume
             try session.setActive(false, options: [.notifyOthersOnDeactivation])
+
+            // 3. Restore .mixWithOthers category and reactivate session for background keep-alive
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             if isWorkoutSessionActive {
                 try session.setActive(true)
-                if keepAlivePlayer?.isPlaying == false {
-                    keepAlivePlayer?.play()
+                if let keepAlive = keepAlivePlayer {
+                    keepAlive.play()
+                } else {
+                    startKeepAliveLoop()
                 }
             }
         } catch {
-            print("[AudioEngine] Failed to restore mix session after ducking: \(error.localizedDescription)")
+            print("[AudioEngine] Restore after duck error: \(error.localizedDescription)")
+            if isWorkoutSessionActive {
+                configureMixAudioSession()
+                keepAlivePlayer?.play()
+            }
         }
     }
 
@@ -102,7 +146,7 @@ public final class AudioEngine: NSObject {
         if let player = keepAlivePlayer, player.isPlaying {
             return
         }
-        let silentData = Self.generateSilentKeepAliveWav(durationSeconds: 1.0)
+        let silentData = Self.generateSilentKeepAliveWav(durationSeconds: 2.0)
         do {
             let player = try AVAudioPlayer(data: silentData, fileTypeHint: AVFileType.wav.rawValue)
             player.numberOfLoops = -1
@@ -111,7 +155,6 @@ public final class AudioEngine: NSObject {
             player.play()
             keepAlivePlayer = player
         } catch {
-            // Safely skip without crashing if keep-alive player cannot be initialized
             print("[AudioEngine] Keep-alive loop skipped safely: \(error.localizedDescription)")
         }
     }
@@ -127,7 +170,7 @@ public final class AudioEngine: NSObject {
                 guard let self, self.isWorkoutSessionActive else { return }
                 if let typeValue, let type = AVAudioSession.InterruptionType(rawValue: typeValue) {
                     if type == .ended {
-                        self.configureAudioSession(duckingActive: false)
+                        self.configureMixAudioSession()
                         self.startKeepAliveLoop()
                     }
                 }
@@ -141,7 +184,9 @@ public final class AudioEngine: NSObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.isWorkoutSessionActive else { return }
-                self.configureAudioSession(duckingActive: false)
+                if !self.isCurrentlyDucking {
+                    self.configureMixAudioSession()
+                }
                 self.startKeepAliveLoop()
             }
         }
@@ -159,29 +204,29 @@ public final class AudioEngine: NSObject {
         switch workout.cueType {
         case .studioVoice:
             let resourceName: String
-            let fallbackWord: String
+            let fallbackText: String
             switch second {
             case 3:
                 resourceName = "voice_3"
-                fallbackWord = "Three"
+                fallbackText = "3"
             case 2:
                 resourceName = "voice_2"
-                fallbackWord = "Two"
+                fallbackText = "2"
             case 1:
                 resourceName = "voice_1"
-                fallbackWord = "One"
+                fallbackText = "1"
             default:
                 return
             }
 
-            if !playBundledMP3IfExists(named: resourceName, volume: volume, estimatedDuration: 0.55) {
-                speakFallback(text: fallbackWord, volume: volume, rate: 0.54, estimatedDuration: 0.55)
+            if !playBundledAudioIfExists(named: resourceName, volume: volume, estimatedDuration: 0.45) {
+                speakFallback(text: fallbackText, volume: volume, rate: 0.58, estimatedDuration: 0.45)
             }
 
         case .soundEffects:
             // Short countdown beeps (NEVER spoken words when Sound Effects is selected)
-            if !playBundledMP3IfExists(named: "sfx_countdown_beep", volume: volume, estimatedDuration: 0.25) {
-                playSynthesizedSFX(key: "sfx_countdown_beep", volume: volume, estimatedDuration: 0.25)
+            if !playBundledAudioIfExists(named: "sfx_countdown_beep", volume: volume, estimatedDuration: 0.16) {
+                playSynthesizedSFX(key: "sfx_countdown_beep", volume: volume, estimatedDuration: 0.16)
             }
         }
     }
@@ -196,19 +241,21 @@ public final class AudioEngine: NSObject {
         switch phase {
         case .getReady:
             if workout.cueType == .soundEffects {
-                playSynthesizedSFX(key: "sfx_countdown_beep", volume: volume * 0.85, estimatedDuration: 0.25)
+                if !playBundledAudioIfExists(named: "sfx_countdown_beep", volume: volume * 0.85, estimatedDuration: 0.16) {
+                    playSynthesizedSFX(key: "sfx_countdown_beep", volume: volume * 0.85, estimatedDuration: 0.16)
+                }
             }
 
         case .work:
             switch workout.cueType {
             case .studioVoice:
-                if !playBundledMP3IfExists(named: "voice_work", volume: volume, estimatedDuration: 0.75) {
-                    speakFallback(text: "Work!", volume: volume, rate: 0.52, estimatedDuration: 0.75)
+                if !playBundledAudioIfExists(named: "voice_work", volume: volume, estimatedDuration: 0.65) {
+                    speakFallback(text: "Work", volume: volume, rate: 0.56, estimatedDuration: 0.65)
                 }
             case .soundEffects:
                 let resource = workout.soundEffectStyle.workSoundResourceName
-                if !playBundledMP3IfExists(named: resource, volume: volume, estimatedDuration: 0.8) {
-                    playSynthesizedSFX(key: resource, volume: volume, estimatedDuration: 0.8)
+                if !playBundledAudioIfExists(named: resource, volume: volume, estimatedDuration: 0.70) {
+                    playSynthesizedSFX(key: resource, volume: volume, estimatedDuration: 0.70)
                 }
             }
 
@@ -216,25 +263,25 @@ public final class AudioEngine: NSObject {
             // Single cue at the start of standard or transition rest
             switch workout.cueType {
             case .studioVoice:
-                if !playBundledMP3IfExists(named: "voice_rest", volume: volume, estimatedDuration: 0.75) {
-                    speakFallback(text: "Rest", volume: volume, rate: 0.50, estimatedDuration: 0.75)
+                if !playBundledAudioIfExists(named: "voice_rest", volume: volume, estimatedDuration: 0.65) {
+                    speakFallback(text: "Rest", volume: volume, rate: 0.54, estimatedDuration: 0.65)
                 }
             case .soundEffects:
                 let resource = workout.soundEffectStyle.restSoundResourceName
-                if !playBundledMP3IfExists(named: resource, volume: volume, estimatedDuration: 0.8) {
-                    playSynthesizedSFX(key: resource, volume: volume, estimatedDuration: 0.8)
+                if !playBundledAudioIfExists(named: resource, volume: volume, estimatedDuration: 0.70) {
+                    playSynthesizedSFX(key: resource, volume: volume, estimatedDuration: 0.70)
                 }
             }
 
         case .done:
             switch workout.cueType {
             case .studioVoice:
-                if !playBundledMP3IfExists(named: "voice_done", volume: volume, estimatedDuration: 1.4) {
-                    speakFallback(text: "Done! Workout complete.", volume: volume, rate: 0.50, estimatedDuration: 1.4)
+                if !playBundledAudioIfExists(named: "voice_done", volume: volume, estimatedDuration: 1.25) {
+                    speakFallback(text: "Workout complete", volume: volume, rate: 0.52, estimatedDuration: 1.25)
                 }
             case .soundEffects:
-                if !playBundledMP3IfExists(named: "voice_done", volume: volume, estimatedDuration: 1.2) {
-                    playSynthesizedSFX(key: "sfx_done_fanfare", volume: volume, estimatedDuration: 1.2)
+                if !playBundledAudioIfExists(named: "voice_done", volume: volume, estimatedDuration: 1.1) {
+                    playSynthesizedSFX(key: "sfx_done_fanfare", volume: volume, estimatedDuration: 1.1)
                 }
             }
         }
@@ -242,30 +289,35 @@ public final class AudioEngine: NSObject {
 
     public func previewCue(for workout: Workout) {
         currentSpotifyBehavior = workout.spotifyBehavior
-        configureAudioSession(duckingActive: false)
         playPhaseStartCue(for: .work, workout: workout)
     }
 
-    // MARK: - Bundle & Fallback Playback Helpers
+    // MARK: - Bundle (.mp3 & .wav) & Fallback Playback Helpers
 
     private func locateBundledSoundURL(named name: String) -> URL? {
+        let extensions = ["mp3", "wav"]
         let subdirs: [String?] = ["Sounds", "Resources/Sounds", nil]
-        for subdir in subdirs {
-            if let url = Bundle.main.url(forResource: name, withExtension: "mp3", subdirectory: subdir) {
-                return url
+
+        for ext in extensions {
+            for subdir in subdirs {
+                if let url = Bundle.main.url(forResource: name, withExtension: ext, subdirectory: subdir) {
+                    return url
+                }
             }
         }
         return nil
     }
 
-    private func playBundledMP3IfExists(named name: String, volume: Float, estimatedDuration: TimeInterval) -> Bool {
+    private func playBundledAudioIfExists(named name: String, volume: Float, estimatedDuration: TimeInterval) -> Bool {
         guard let url = locateBundledSoundURL(named: name) else {
             return false
         }
         do {
+            // Create a dedicated AVAudioPlayer instance per sound so rapid 3-2-1-Work cues never cut each other off
             let player = try AVAudioPlayer(contentsOf: url)
             guard player.duration > 0.02 else { return false }
-            beginDuckingIfNeeded(estimatedDuration: player.duration)
+            activeCuePlayers.removeAll { !$0.isPlaying }
+            activateDuckingBeforeCue(fallbackDuration: player.duration)
             player.delegate = self
             player.volume = volume
             player.prepareToPlay()
@@ -273,21 +325,21 @@ public final class AudioEngine: NSObject {
             activeCuePlayers.append(player)
             return true
         } catch {
-            print("[AudioEngine] Failed to play bundled MP3 \(name): \(error.localizedDescription)")
+            print("[AudioEngine] Failed to play bundled audio \(name): \(error.localizedDescription)")
             return false
         }
     }
 
     private func speakFallback(text: String, volume: Float, rate: Float, estimatedDuration: TimeInterval) {
-        beginDuckingIfNeeded(estimatedDuration: estimatedDuration)
-        if speechSynthesizer.isSpeaking {
-            speechSynthesizer.stopSpeaking(at: .immediate)
-        }
+        activateDuckingBeforeCue(fallbackDuration: estimatedDuration)
+        // Do NOT call stopSpeaking(at: .immediate) synchronously before speak(), as iOS 17 drops the new utterance
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
         utterance.volume = volume
         utterance.rate = rate
         utterance.pitchMultiplier = 1.05
+        utterance.preUtteranceDelay = 0.0
+        utterance.postUtteranceDelay = 0.0
         speechSynthesizer.speak(utterance)
     }
 
@@ -297,8 +349,9 @@ public final class AudioEngine: NSObject {
             return
         }
         do {
+            activeCuePlayers.removeAll { !$0.isPlaying }
             let player = try AVAudioPlayer(data: wavData, fileTypeHint: AVFileType.wav.rawValue)
-            beginDuckingIfNeeded(estimatedDuration: max(estimatedDuration, player.duration))
+            activateDuckingBeforeCue(fallbackDuration: max(estimatedDuration, player.duration))
             player.delegate = self
             player.volume = volume
             player.prepareToPlay()
@@ -312,24 +365,26 @@ public final class AudioEngine: NSObject {
     // MARK: - Studio-Quality Synthesized Tone Generator (Fallback SFX)
 
     private func prewarmSynthesizedTones() {
-        // Countdown short beep (crisp 880 Hz 110ms)
+        // Countdown short beep (crisp, punchy 987.77 Hz B5 120ms studio timer pip)
         synthesizedToneCache["sfx_countdown_beep"] = Self.generateToneWav(
-            segments: [(freq: 880, duration: 0.11, harmonics: [1.0, 0.25], decay: 8.0)]
+            segments: [
+                (freq: 987.77, duration: 0.12, harmonics: [1.0, 0.45, 0.2], decay: 6.5)
+            ]
         )
 
-        // 1. Beep (High double-beep for Work, lower single-beep for Rest)
+        // 1. Beep (High punchy double-beep + long high tone for Work, warm lower tone for Rest)
         synthesizedToneCache["sfx_beep_work"] = Self.generateToneWav(
             segments: [
-                (freq: 1046.5, duration: 0.14, harmonics: [1.0, 0.3], decay: 6.0),
-                (freq: 0, duration: 0.05, harmonics: [], decay: 1.0),
-                (freq: 1318.5, duration: 0.28, harmonics: [1.0, 0.35], decay: 5.0)
+                (freq: 1318.5, duration: 0.11, harmonics: [1.0, 0.45, 0.2], decay: 5.0),
+                (freq: 0, duration: 0.04, harmonics: [], decay: 1.0),
+                (freq: 1567.98, duration: 0.34, harmonics: [1.0, 0.5, 0.25], decay: 3.8)
             ]
         )
         synthesizedToneCache["sfx_beep_rest"] = Self.generateToneWav(
             segments: [
-                (freq: 659.25, duration: 0.14, harmonics: [1.0, 0.25], decay: 6.0),
-                (freq: 0, duration: 0.05, harmonics: [], decay: 1.0),
-                (freq: 523.25, duration: 0.28, harmonics: [1.0, 0.25], decay: 5.0)
+                (freq: 783.99, duration: 0.12, harmonics: [1.0, 0.35, 0.15], decay: 5.0),
+                (freq: 0, duration: 0.04, harmonics: [], decay: 1.0),
+                (freq: 587.33, duration: 0.32, harmonics: [1.0, 0.35, 0.15], decay: 4.0)
             ]
         )
 
@@ -432,8 +487,8 @@ public final class AudioEngine: NSObject {
 
             for i in 0..<count {
                 let t = Double(i) / Double(sampleRate)
-                let attack = min(1.0, t / 0.008)
-                let release = min(1.0, (seg.duration - t) / 0.015)
+                let attack = min(1.0, t / 0.003)
+                let release = min(1.0, (seg.duration - t) / 0.012)
                 let envelope = attack * release * exp(-seg.decay * t)
 
                 let instantFreq = seg.freq + (vibratoDepth * sin(2.0 * .pi * vibratoHz * t))
@@ -446,7 +501,7 @@ public final class AudioEngine: NSObject {
                 }
 
                 let normalized = (sampleVal / weightSum) * envelope
-                let clamped = max(-0.95, min(0.95, normalized))
+                let clamped = max(-0.98, min(0.98, normalized))
                 allSamples.append(Int16(clamped * Double(Int16.max)))
             }
         }
@@ -501,11 +556,20 @@ public final class AudioEngine: NSObject {
 extension AudioEngine: AVAudioPlayerDelegate, AVSpeechSynthesizerDelegate {
     nonisolated public func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor [weak self] in
-            self?.activeCuePlayers.removeAll { $0 === player }
+            guard let self else { return }
+            self.activeCuePlayers.removeAll { $0 === player || !$0.isPlaying }
+            if self.currentSpotifyBehavior == .duck {
+                self.scheduleDuckRestore(after: 0.12)
+            }
         }
     }
 
     nonisolated public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        // Restored by duckRestoreTask timer
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if self.currentSpotifyBehavior == .duck {
+                self.scheduleDuckRestore(after: 0.12)
+            }
+        }
     }
 }

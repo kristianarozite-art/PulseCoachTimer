@@ -24,19 +24,30 @@ public final class TimerViewModel {
     public private(set) var isCompleted: Bool = false
     public var isControlsLocked: Bool = false
 
+    // Session-only adjustable settings (never overwrites saved WorkoutStore preset)
+    public private(set) var sessionWorkDuration: Int
+    public private(set) var sessionRestDuration: Int
+    public private(set) var sessionTransitionRestDuration: Int
+    public private(set) var sessionExerciseCount: Int
+
     private var phaseStartDate: Date = Date()
     private var phaseEndDate: Date = Date()
     private var pausedRemainingInPhase: TimeInterval = 0
     private var spokenCountdownSeconds: Set<Int> = []
-    private var timer: Timer?
-    private var notificationObserver: NSObjectProtocol?
+    private var dispatchTimer: DispatchSourceTimer?
+    private var pauseObserver: NSObjectProtocol?
+    private var addTenObserver: NSObjectProtocol?
 
     public init(workout: Workout) {
         self.workout = workout
         self.totalExercises = workout.exerciseCount
         self.totalReps = workout.repsPerExercise
+        self.sessionWorkDuration = workout.workDuration
+        self.sessionRestDuration = workout.restDuration
+        self.sessionTransitionRestDuration = workout.transitionRestDuration
+        self.sessionExerciseCount = workout.exerciseCount
         self.phases = workout.buildPhases()
-        setupLiveActivityObserver()
+        setupLiveActivityObservers()
     }
 
     // MARK: - Computed Display Properties
@@ -76,11 +87,22 @@ public final class TimerViewModel {
         !isCompleted && (currentPhaseType == .rest || currentPhaseType == .transitionRest)
     }
 
+    public var minAllowedExercises: Int {
+        max(1, currentExercise)
+    }
+
     // MARK: - Workout Control Actions
 
     public func startWorkout() {
         UIApplication.shared.isIdleTimerDisabled = true
         AudioEngine.shared.startWorkoutAudioSession(spotifyBehavior: workout.spotifyBehavior)
+
+        sessionWorkDuration = workout.workDuration
+        sessionRestDuration = workout.restDuration
+        sessionTransitionRestDuration = workout.transitionRestDuration
+        sessionExerciseCount = workout.exerciseCount
+        totalExercises = workout.exerciseCount
+        totalReps = workout.repsPerExercise
 
         phases = workout.buildPhases()
         isPaused = false
@@ -95,9 +117,12 @@ public final class TimerViewModel {
         WorkoutLiveActivityBridge.shared.onTogglePause = { [weak self] in
             self?.togglePauseFromLiveActivity()
         }
+        WorkoutLiveActivityBridge.shared.onAddTenSeconds = { [weak self] in
+            self?.addTenSecondsToRest()
+        }
 
         enterPhase(at: 0, anchorDate: Date(), isInitialStart: true)
-        startRunLoopTimer()
+        startBackgroundSafeTimer()
     }
 
     public func pauseWorkout() {
@@ -106,7 +131,7 @@ public final class TimerViewModel {
         pausedRemainingInPhase = max(0, phaseEndDate.timeIntervalSince(now))
         remainingTimeInPhase = pausedRemainingInPhase
         isPaused = true
-        stopRunLoopTimer()
+        stopBackgroundSafeTimer()
         triggerImpactHaptic(.medium)
         syncLiveActivity()
     }
@@ -119,7 +144,7 @@ public final class TimerViewModel {
         remainingTimeInPhase = pausedRemainingInPhase
         isPaused = false
         triggerImpactHaptic(.light)
-        startRunLoopTimer()
+        startBackgroundSafeTimer()
         syncLiveActivity()
     }
 
@@ -133,7 +158,7 @@ public final class TimerViewModel {
 
     public func restartWorkout() {
         triggerImpactHaptic(.medium)
-        stopRunLoopTimer()
+        stopBackgroundSafeTimer()
         startWorkout()
     }
 
@@ -145,47 +170,244 @@ public final class TimerViewModel {
         if isPaused {
             pausedRemainingInPhase += 10.0
             remainingTimeInPhase = pausedRemainingInPhase
+            let now = Date()
+            phaseEndDate = now.addingTimeInterval(pausedRemainingInPhase)
+            phaseStartDate = phaseEndDate.addingTimeInterval(-currentPhaseTotalDuration)
         } else {
             phaseEndDate = phaseEndDate.addingTimeInterval(10.0)
             remainingTimeInPhase = max(0, phaseEndDate.timeIntervalSince(Date()))
         }
 
-        // Re-allow 3-2-1 countdown if adding +10s pushed remaining time above 3 seconds
-        if remainingTimeInPhase > 3.5 {
+        if remainingTimeInPhase > 3.2 {
             spokenCountdownSeconds.removeAll()
         }
 
         syncLiveActivity()
     }
 
+    // MARK: - Session-Only Adjustments While Paused
+
+    public func adjustSessionWorkDuration(by delta: Int) {
+        let oldVal = sessionWorkDuration
+        let newVal = min(600, max(5, oldVal + delta))
+        let appliedDelta = newVal - oldVal
+        guard appliedDelta != 0 else { return }
+        sessionWorkDuration = newVal
+        triggerImpactHaptic(.light)
+
+        if currentPhaseType == .work {
+            applyDeltaToCurrentPausedPhase(TimeInterval(appliedDelta))
+        }
+        rebuildUpcomingPhases()
+    }
+
+    public func adjustSessionRestDuration(by delta: Int) {
+        let oldVal = sessionRestDuration
+        let newVal = min(300, max(0, oldVal + delta))
+        let appliedDelta = newVal - oldVal
+        guard appliedDelta != 0 else { return }
+        sessionRestDuration = newVal
+        triggerImpactHaptic(.light)
+
+        if currentPhaseType == .rest {
+            applyDeltaToCurrentPausedPhase(TimeInterval(appliedDelta))
+        }
+        rebuildUpcomingPhases()
+    }
+
+    public func adjustSessionTransitionRestDuration(by delta: Int) {
+        let oldVal = sessionTransitionRestDuration
+        let newVal = min(600, max(0, oldVal + delta))
+        let appliedDelta = newVal - oldVal
+        guard appliedDelta != 0 else { return }
+        sessionTransitionRestDuration = newVal
+        triggerImpactHaptic(.light)
+
+        if currentPhaseType == .transitionRest {
+            applyDeltaToCurrentPausedPhase(TimeInterval(appliedDelta))
+        }
+        rebuildUpcomingPhases()
+    }
+
+    public func adjustSessionExerciseCount(by delta: Int) {
+        let minAllowed = minAllowedExercises
+        let oldVal = sessionExerciseCount
+        let newVal = min(50, max(minAllowed, oldVal + delta))
+        guard newVal != oldVal else { return }
+        sessionExerciseCount = newVal
+        totalExercises = newVal
+        triggerImpactHaptic(.light)
+        rebuildUpcomingPhases()
+    }
+
+    private func applyDeltaToCurrentPausedPhase(_ deltaSeconds: TimeInterval) {
+        let newRemaining = max(1.0, pausedRemainingInPhase + deltaSeconds)
+        let actualChange = newRemaining - pausedRemainingInPhase
+        pausedRemainingInPhase = newRemaining
+        remainingTimeInPhase = newRemaining
+        currentPhaseTotalDuration = max(newRemaining, currentPhaseTotalDuration + actualChange)
+        if phases.indices.contains(currentPhaseIndex) {
+            phases[currentPhaseIndex].duration = currentPhaseTotalDuration
+        }
+        let now = Date()
+        phaseEndDate = now.addingTimeInterval(pausedRemainingInPhase)
+        phaseStartDate = phaseEndDate.addingTimeInterval(-currentPhaseTotalDuration)
+    }
+
+    private func rebuildUpcomingPhases() {
+        guard !isCompleted, phases.indices.contains(currentPhaseIndex) else { return }
+
+        var newUpcoming: [WorkoutPhaseStep] = []
+        let totalEx = max(currentExercise, sessionExerciseCount)
+        let repsCount = max(1, totalReps)
+
+        func appendRestAfter(ex: Int, rep: Int) {
+            let isLastEx = (ex == totalEx)
+            let isLastRep = (rep == repsCount)
+            if isLastEx && isLastRep {
+                return
+            }
+            if isLastRep {
+                if workout.enableTransitionRest {
+                    if sessionTransitionRestDuration > 0 {
+                        newUpcoming.append(
+                            WorkoutPhaseStep(
+                                type: .transitionRest,
+                                duration: TimeInterval(sessionTransitionRestDuration),
+                                exerciseIndex: ex,
+                                totalExercises: totalEx,
+                                repIndex: rep,
+                                totalReps: repsCount
+                            )
+                        )
+                    }
+                } else if sessionRestDuration > 0 {
+                    newUpcoming.append(
+                        WorkoutPhaseStep(
+                            type: .rest,
+                            duration: TimeInterval(sessionRestDuration),
+                            exerciseIndex: ex,
+                            totalExercises: totalEx,
+                            repIndex: rep,
+                            totalReps: repsCount
+                        )
+                    )
+                }
+            } else if sessionRestDuration > 0 {
+                newUpcoming.append(
+                    WorkoutPhaseStep(
+                        type: .rest,
+                        duration: TimeInterval(sessionRestDuration),
+                        exerciseIndex: ex,
+                        totalExercises: totalEx,
+                        repIndex: rep,
+                        totalReps: repsCount
+                    )
+                )
+            }
+        }
+
+        func appendWorkAndRest(ex: Int, rep: Int) {
+            newUpcoming.append(
+                WorkoutPhaseStep(
+                    type: .work,
+                    duration: TimeInterval(max(1, sessionWorkDuration)),
+                    exerciseIndex: ex,
+                    totalExercises: totalEx,
+                    repIndex: rep,
+                    totalReps: repsCount
+                )
+            )
+            appendRestAfter(ex: ex, rep: rep)
+        }
+
+        switch currentPhaseType {
+        case .getReady:
+            for ex in 1...totalEx {
+                for rep in 1...repsCount {
+                    appendWorkAndRest(ex: ex, rep: rep)
+                }
+            }
+
+        case .work:
+            // First, rest after the current work interval (if not the final rep of the final exercise)
+            appendRestAfter(ex: currentExercise, rep: currentRep)
+            // Remaining reps of currentExercise
+            if currentRep < repsCount {
+                for rep in (currentRep + 1)...repsCount {
+                    appendWorkAndRest(ex: currentExercise, rep: rep)
+                }
+            }
+            // Remaining exercises
+            if currentExercise < totalEx {
+                for ex in (currentExercise + 1)...totalEx {
+                    for rep in 1...repsCount {
+                        appendWorkAndRest(ex: ex, rep: rep)
+                    }
+                }
+            }
+
+        case .rest, .transitionRest:
+            // Remaining reps of currentExercise
+            if currentRep < repsCount {
+                for rep in (currentRep + 1)...repsCount {
+                    appendWorkAndRest(ex: currentExercise, rep: rep)
+                }
+            }
+            // Remaining exercises
+            if currentExercise < totalEx {
+                for ex in (currentExercise + 1)...totalEx {
+                    for rep in 1...repsCount {
+                        appendWorkAndRest(ex: ex, rep: rep)
+                    }
+                }
+            }
+
+        case .done:
+            break
+        }
+
+        // Update current phase's totalExercises metadata and replace tail of phases array
+        let prefix = Array(phases[0...currentPhaseIndex])
+        phases = prefix + newUpcoming
+        totalExercises = totalEx
+        futurePhasesDuration = newUpcoming.reduce(0) { $0 + $1.duration }
+        syncLiveActivity()
+    }
+
     public func stopAndCleanup() {
-        stopRunLoopTimer()
+        stopBackgroundSafeTimer()
         UIApplication.shared.isIdleTimerDisabled = false
         WorkoutLiveActivityBridge.shared.onTogglePause = nil
-        if let observer = notificationObserver {
+        WorkoutLiveActivityBridge.shared.onAddTenSeconds = nil
+        if let observer = pauseObserver {
             NotificationCenter.default.removeObserver(observer)
-            notificationObserver = nil
+            pauseObserver = nil
+        }
+        if let observer = addTenObserver {
+            NotificationCenter.default.removeObserver(observer)
+            addTenObserver = nil
         }
         AudioEngine.shared.stopWorkoutAudioSession()
         LiveActivityManager.shared.endActivity()
     }
 
-    // MARK: - Internal Phase & Timestamp Engine
+    // MARK: - Internal Phase & Timestamp Engine (DispatchSourceTimer for Lock Screen Reliability)
 
-    private func startRunLoopTimer() {
-        stopRunLoopTimer()
-        let newTimer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.handleTimerTick()
-            }
+    private func startBackgroundSafeTimer() {
+        stopBackgroundSafeTimer()
+        let source = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
+        source.schedule(deadline: .now() + .milliseconds(40), repeating: .milliseconds(40), leeway: .milliseconds(5))
+        source.setEventHandler { [weak self] in
+            self?.handleTimerTick()
         }
-        RunLoop.main.add(newTimer, forMode: .common)
-        timer = newTimer
+        source.resume()
+        dispatchTimer = source
     }
 
-    private func stopRunLoopTimer() {
-        timer?.invalidate()
-        timer = nil
+    private func stopBackgroundSafeTimer() {
+        dispatchTimer?.cancel()
+        dispatchTimer = nil
     }
 
     private func handleTimerTick() {
@@ -214,7 +436,7 @@ public final class TimerViewModel {
 
         currentPhaseType = step.type
         currentExercise = step.exerciseIndex
-        totalExercises = step.totalExercises
+        totalExercises = sessionExerciseCount
         currentRep = step.repIndex
         totalReps = step.totalReps
         currentPhaseTotalDuration = step.duration
@@ -227,7 +449,6 @@ public final class TimerViewModel {
         }
 
         let now = Date()
-        // If anchorDate is far in the past (e.g. device was suspended), clamp cleanly
         let effectiveStart = (now.timeIntervalSince(anchorDate) < step.duration) ? anchorDate : now
         phaseStartDate = effectiveStart
         phaseEndDate = effectiveStart.addingTimeInterval(step.duration)
@@ -237,13 +458,15 @@ public final class TimerViewModel {
         AudioEngine.shared.playPhaseStartCue(for: step.type, workout: workout)
         triggerPhaseHaptic(for: step.type)
 
+        // Immediately push state update to LiveActivityManager from ViewModel (works even when screen is locked)
+        let currentState = buildActivityState()
         if isInitialStart {
             LiveActivityManager.shared.startActivity(
                 workoutName: workout.name,
-                state: buildActivityState()
+                state: currentState
             )
         } else {
-            syncLiveActivity()
+            LiveActivityManager.shared.updateActivity(with: currentState)
         }
     }
 
@@ -268,7 +491,7 @@ public final class TimerViewModel {
     }
 
     private func completeWorkout() {
-        stopRunLoopTimer()
+        stopBackgroundSafeTimer()
         isCompleted = true
         isPaused = false
         currentPhaseType = .done
@@ -301,14 +524,24 @@ public final class TimerViewModel {
         LiveActivityManager.shared.updateActivity(with: buildActivityState())
     }
 
-    private func setupLiveActivityObserver() {
-        notificationObserver = NotificationCenter.default.addObserver(
+    private func setupLiveActivityObservers() {
+        pauseObserver = NotificationCenter.default.addObserver(
             forName: .pulseCoachTogglePauseFromLiveActivity,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.togglePauseFromLiveActivity()
+            }
+        }
+
+        addTenObserver = NotificationCenter.default.addObserver(
+            forName: .pulseCoachAddTenSecondsFromLiveActivity,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.addTenSecondsToRest()
             }
         }
     }

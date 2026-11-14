@@ -16,6 +16,12 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Generate Studio Voice MP3 Cues (edge-tts + ffmpeg)
+        run: |
+          pip3 install --quiet edge-tts
+          python3 scripts/generate_voice_cues.py
+          ls -lh PulseCoach/Resources/Sounds/
+
       - name: Install XcodeGen
         run: |
           if ! command -v xcodegen &> /dev/null; then

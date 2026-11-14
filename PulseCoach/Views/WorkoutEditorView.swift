@@ -273,13 +273,12 @@ public struct WorkoutEditorView: View {
                     .foregroundStyle(color)
             }
 
-            HStack(spacing: 8) {
+            HStack(spacing: 10) {
+                quickStepButton(label: "-10s", delta: -10, value: value, range: range)
                 quickStepButton(label: "-5s", delta: -5, value: value, range: range)
-                quickStepButton(label: "-1s", delta: -1, value: value, range: range)
                 Spacer()
-                quickStepButton(label: "+1s", delta: 1, value: value, range: range)
                 quickStepButton(label: "+5s", delta: 5, value: value, range: range)
-                quickStepButton(label: "+15s", delta: 15, value: value, range: range)
+                quickStepButton(label: "+10s", delta: 10, value: value, range: range)
             }
         }
         .padding(.vertical, 4)
@@ -296,9 +295,12 @@ public struct WorkoutEditorView: View {
             value.wrappedValue = min(range.upperBound, max(range.lowerBound, updated))
         } label: {
             Text(label)
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .font(.system(size: 13, weight: .semibold, design: .default))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(minWidth: 52)
                 .padding(.horizontal, 12)
-                .padding(.vertical, 6)
+                .padding(.vertical, 7)
                 .background(Color.white.opacity(0.1), in: Capsule())
         }
         .buttonStyle(.plain)

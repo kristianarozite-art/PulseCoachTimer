@@ -11,31 +11,43 @@ struct PulseCoachLiveActivityWidget: Widget {
                 workoutName: context.attributes.workoutName,
                 state: context.state
             )
-            .activityBackgroundTint(Color.black.opacity(0.88))
+            .activityBackgroundTint(Color.black.opacity(0.90))
             .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text(context.state.phase.displayTitle)
-                            .font(.system(size: 13, weight: .heavy, design: .rounded))
+                            .font(.system(size: 13, weight: .heavy, design: .default))
                             .foregroundStyle(phaseTintColor(for: context.state.phase))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
                         Text(context.state.counterText)
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.75))
+                            .font(.system(size: 11, weight: .semibold, design: .default))
+                            .foregroundStyle(.white.opacity(0.78))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
                     }
                 }
                 DynamicIslandExpandedRegion(.trailing) {
                     liveTimerText(for: context.state, fontSize: 24)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    HStack {
+                    HStack(spacing: 10) {
                         Text(context.attributes.workoutName)
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.white.opacity(0.65))
                             .lineLimit(1)
 
                         Spacer()
+
+                        if context.state.phase == .rest || context.state.phase == .transitionRest {
+                            Button(intent: AddTenSecondsIntent()) {
+                                Text("+10s")
+                                    .font(.caption.weight(.heavy))
+                            }
+                            .tint(phaseTintColor(for: context.state.phase))
+                        }
 
                         if context.state.phase != .done {
                             Button(intent: ToggleWorkoutPauseIntent()) {
@@ -50,15 +62,31 @@ struct PulseCoachLiveActivityWidget: Widget {
                     }
                 }
             } compactLeading: {
-                Text(shortPhaseLabel(for: context.state.phase))
-                    .font(.system(size: 12, weight: .heavy, design: .rounded))
-                    .foregroundStyle(phaseTintColor(for: context.state.phase))
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(phaseTintColor(for: context.state.phase))
+                        .frame(width: 8, height: 8)
+                    Text(shortPhaseLabel(for: context.state.phase))
+                        .font(.system(size: 12, weight: .heavy, design: .default))
+                        .foregroundStyle(phaseTintColor(for: context.state.phase))
+                        .lineLimit(1)
+                }
             } compactTrailing: {
                 liveTimerText(for: context.state, fontSize: 13)
                     .frame(maxWidth: 46)
             } minimal: {
-                Image(systemName: "timer")
-                    .foregroundStyle(phaseTintColor(for: context.state.phase))
+                // Dynamic Island minimal view (when Spotify occupies the other half):
+                // Circular icon dynamically colored to match current phase
+                ZStack {
+                    Circle()
+                        .fill(phaseTintColor(for: context.state.phase).opacity(0.25))
+                    Circle()
+                        .strokeBorder(phaseTintColor(for: context.state.phase), lineWidth: 2.2)
+                    Image(systemName: "timer")
+                        .font(.system(size: 11, weight: .heavy))
+                        .foregroundStyle(phaseTintColor(for: context.state.phase))
+                }
+                .frame(width: 22, height: 22)
             }
         }
     }
@@ -68,21 +96,30 @@ private struct LockScreenLiveActivityBanner: View {
     let workoutName: String
     let state: PulseCoachActivityAttributes.ContentState
 
+    private var isRestPhase: Bool {
+        state.phase == .rest || state.phase == .transitionRest
+    }
+
     var body: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 10) {
             // Left: Phase badge + Exercise/Rep counter
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
                     Circle()
                         .fill(phaseTintColor(for: state.phase))
                         .frame(width: 8, height: 8)
+
                     Text(state.phase.displayTitle)
-                        .font(.system(size: 15, weight: .black, design: .rounded))
+                        .font(.system(size: 15, weight: .black, design: .default))
                         .foregroundStyle(phaseTintColor(for: state.phase))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+
                     if state.isPaused {
                         Text("PAUSED")
-                            .font(.system(size: 10, weight: .heavy, design: .rounded))
+                            .font(.system(size: 10, weight: .heavy, design: .default))
                             .foregroundStyle(.black)
+                            .lineLimit(1)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
                             .background(Color.yellow, in: Capsule())
@@ -90,33 +127,54 @@ private struct LockScreenLiveActivityBanner: View {
                 }
 
                 Text(state.counterText)
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .font(.system(size: 13, weight: .bold, design: .default))
                     .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
 
-                Text(workoutName)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.55))
+                Text("Total left: \(formatMMSS(state.totalRemainingSeconds))")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.6))
                     .lineLimit(1)
             }
+            .layoutPriority(1)
 
-            Spacer()
+            Spacer(minLength: 6)
 
             // Center-Right: Live Countdown Timer
-            liveTimerText(for: state, fontSize: 34)
+            liveTimerText(for: state, fontSize: 32)
 
-            // Right: Pause / Resume AppIntent Button
+            // Right: +10s (during Rest/Transition Rest) & Pause/Resume AppIntent Buttons
             if state.phase != .done {
-                Button(intent: ToggleWorkoutPauseIntent()) {
-                    Image(systemName: state.isPaused ? "play.fill" : "pause.fill")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(.black)
-                        .frame(width: 40, height: 40)
-                        .background(phaseTintColor(for: state.phase), in: Circle())
+                HStack(spacing: 8) {
+                    if isRestPhase {
+                        Button(intent: AddTenSecondsIntent()) {
+                            Text("+10s")
+                                .font(.system(size: 13, weight: .heavy, design: .default))
+                                .lineLimit(1)
+                                .foregroundStyle(.black)
+                                .padding(.horizontal, 10)
+                                .frame(height: 38)
+                                .background(phaseTintColor(for: state.phase), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Button(intent: ToggleWorkoutPauseIntent()) {
+                        Image(systemName: state.isPaused ? "play.fill" : "pause.fill")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundStyle(.black)
+                            .frame(width: 38, height: 38)
+                            .background(
+                                state.isPaused ? Color(red: 0.19, green: 0.82, blue: 0.35) : Color.white,
+                                in: Circle()
+                            )
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 16)
         .padding(.vertical, 14)
     }
 }
@@ -128,20 +186,23 @@ private func liveTimerText(
 ) -> some View {
     if state.phase == .done {
         Text("DONE")
-            .font(.system(size: fontSize * 0.7, weight: .black, design: .rounded))
+            .font(.system(size: fontSize * 0.7, weight: .black, design: .default))
+            .lineLimit(1)
             .foregroundStyle(.green)
     } else if state.isPaused {
         Text(formatSeconds(state.pausedRemainingSeconds))
-            .font(.system(size: fontSize, weight: .black, design: .rounded))
+            .font(.system(size: fontSize, weight: .black, design: .default))
             .monospacedDigit()
+            .lineLimit(1)
             .foregroundStyle(.yellow)
     } else {
         Text(
             timerInterval: state.phaseStartDate...state.phaseEndDate,
             countsDown: true
         )
-        .font(.system(size: fontSize, weight: .black, design: .rounded))
+        .font(.system(size: fontSize, weight: .black, design: .default))
         .monospacedDigit()
+        .lineLimit(1)
         .foregroundStyle(.white)
         .multilineTextAlignment(.trailing)
     }
@@ -154,18 +215,25 @@ private func formatSeconds(_ total: Int) -> String {
     return String(format: "%d:%02d", m, s)
 }
 
+private func formatMMSS(_ total: Int) -> String {
+    let clamped = max(0, total)
+    let m = clamped / 60
+    let s = clamped % 60
+    return String(format: "%02d:%02d", m, s)
+}
+
 private func phaseTintColor(for phase: WorkoutPhaseType) -> Color {
     switch phase {
     case .getReady:
-        return Color(red: 1.0, green: 0.84, blue: 0.15)
+        return Color(red: 1.0, green: 0.84, blue: 0.15) // Yellow
     case .work:
-        return Color(red: 1.0, green: 0.23, blue: 0.19)
+        return Color(red: 1.0, green: 0.23, blue: 0.19) // Red
     case .rest:
-        return Color(red: 0.19, green: 0.82, blue: 0.35)
+        return Color(red: 0.19, green: 0.82, blue: 0.35) // Green
     case .transitionRest:
-        return Color(red: 0.04, green: 0.52, blue: 1.0)
+        return Color(red: 0.04, green: 0.52, blue: 1.0) // Blue
     case .done:
-        return Color.green
+        return Color(red: 0.19, green: 0.82, blue: 0.35)
     }
 }
 
