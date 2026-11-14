@@ -1,0 +1,72 @@
+name: Build Unsigned iOS IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    name: Generate Xcode Project & Build Unsigned IPA
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build Unsigned Release App
+        run: |
+          xcodebuild clean build \
+            -project PulseCoach.xcodeproj \
+            -scheme PulseCoach \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package PulseCoach.ipa
+        run: |
+          mkdir -p build/ipa/Payload
+          PRODUCTS_DIR="build/DerivedData/Build/Products/Release-iphoneos"
+          APP_PATH="$PRODUCTS_DIR/PulseCoach.app"
+          if [ ! -d "$APP_PATH" ]; then
+            APP_PATH=$(find build/DerivedData/Build/Products -name "PulseCoach.app" -type d | head -n 1)
+          fi
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "Error: PulseCoach.app not found in DerivedData!"
+            exit 1
+          fi
+          cp -R "$APP_PATH" build/ipa/Payload/
+
+          # Ensure PlugIns/*.appex is included if built alongside the app
+          APPEX_PATH=$(find build/DerivedData/Build/Products -name "PulseCoachWidget.appex" -type d | head -n 1)
+          if [ -n "$APPEX_PATH" ] && [ -d "$APPEX_PATH" ] && [ ! -d "build/ipa/Payload/PulseCoach.app/PlugIns/PulseCoachWidget.appex" ]; then
+            mkdir -p "build/ipa/Payload/PulseCoach.app/PlugIns"
+            cp -R "$APPEX_PATH" "build/ipa/Payload/PulseCoach.app/PlugIns/"
+          fi
+
+          cd build/ipa
+          zip -r9 ../../PulseCoach.ipa Payload
+
+      - name: Upload PulseCoach.ipa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PulseCoach-ipa
+          path: PulseCoach.ipa
+          if-no-files-found: error
+          retention-days: 30
