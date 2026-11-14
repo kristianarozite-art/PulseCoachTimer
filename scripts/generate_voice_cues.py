@@ -1,6 +1,7 @@
 import asyncio
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -29,7 +30,7 @@ def find_ffmpeg() -> str | None:
     return shutil.which("ffmpeg")
 
 
-async def synthesize_all(output_dir: Path) -> None:
+async def synthesize_all(output_dir: Path, force: bool = False) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_bin = find_ffmpeg()
     print(f"Using voice: {VOICE} (rate={RATE}, pitch={PITCH})")
@@ -37,8 +38,8 @@ async def synthesize_all(output_dir: Path) -> None:
 
     for filename, text in CUES.items():
         target_path = output_dir / filename
-        if target_path.exists() and target_path.stat().st_size > 1024:
-            print(f"Skipping {filename} (already exists, {target_path.stat().st_size} bytes)")
+        if not force and target_path.exists() and target_path.stat().st_size > 1024:
+            print(f"Keeping existing {filename} ({target_path.stat().st_size} bytes)")
             continue
 
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
@@ -49,14 +50,14 @@ async def synthesize_all(output_dir: Path) -> None:
             await communicate.save(str(tmp_path))
 
             if ffmpeg_bin:
-                # Trim leading silence and normalize loudness so cues fire instantaneously at 0ms
+                # Trim dead leading silence, then keep 40ms clean lead-in padding so first syllable is never clipped
                 cmd = [
                     ffmpeg_bin,
                     "-y",
                     "-i",
                     str(tmp_path),
                     "-af",
-                    "silenceremove=start_periods=1:start_duration=0.005:start_threshold=-42dB,volume=1.4,alimiter=limit=0.95",
+                    "silenceremove=start_periods=1:start_duration=0.005:start_threshold=-48dB,adelay=40|40,volume=1.4,alimiter=limit=0.95",
                     "-ar",
                     "44100",
                     "-ac",
@@ -77,6 +78,7 @@ async def synthesize_all(output_dir: Path) -> None:
 
 
 if __name__ == "__main__":
+    force_regen = "--force" in sys.argv
     repo_root = Path(__file__).resolve().parent.parent
     sounds_dir = repo_root / "PulseCoach" / "Resources" / "Sounds"
-    asyncio.run(synthesize_all(sounds_dir))
+    asyncio.run(synthesize_all(sounds_dir, force=force_regen))
