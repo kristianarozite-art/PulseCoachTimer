@@ -466,18 +466,18 @@ public final class AudioEngine: NSObject {
         data.reserveCapacity(Int(44 + dataSize))
 
         data.append(contentsOf: "RIFF".utf8)
-        data.append(littleEndianBytes(chunkSize))
+        data.append(contentsOf: littleEndianBytes(chunkSize))
         data.append(contentsOf: "WAVE".utf8)
         data.append(contentsOf: "fmt ".utf8)
-        data.append(littleEndianBytes(UInt32(16)))
-        data.append(littleEndianBytes(UInt16(1)))
-        data.append(littleEndianBytes(numChannels))
-        data.append(littleEndianBytes(UInt32(sampleRate)))
-        data.append(littleEndianBytes(byteRate))
-        data.append(littleEndianBytes(blockAlign))
-        data.append(littleEndianBytes(bitsPerSample))
+        data.append(contentsOf: littleEndianBytes(UInt32(16)))
+        data.append(contentsOf: littleEndianBytes(UInt16(1)))
+        data.append(contentsOf: littleEndianBytes(numChannels))
+        data.append(contentsOf: littleEndianBytes(UInt32(sampleRate)))
+        data.append(contentsOf: littleEndianBytes(byteRate))
+        data.append(contentsOf: littleEndianBytes(blockAlign))
+        data.append(contentsOf: littleEndianBytes(bitsPerSample))
         data.append(contentsOf: "data".utf8)
-        data.append(littleEndianBytes(dataSize))
+        data.append(contentsOf: littleEndianBytes(dataSize))
 
         samples.withUnsafeBufferPointer { buffer in
             if let base = buffer.baseAddress {
