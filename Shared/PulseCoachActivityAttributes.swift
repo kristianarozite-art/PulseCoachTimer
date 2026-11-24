@@ -23,8 +23,10 @@ public struct PulseCoachActivityAttributes: ActivityAttributes {
         public var isPaused: Bool
         public var phaseStartDate: Date
         public var phaseEndDate: Date
+        public var workoutEndDate: Date
         public var pausedRemainingSeconds: Int
         public var totalRemainingSeconds: Int
+        public var updateSequence: Int
 
         public init(
             phase: WorkoutPhaseType,
@@ -35,8 +37,10 @@ public struct PulseCoachActivityAttributes: ActivityAttributes {
             isPaused: Bool,
             phaseStartDate: Date,
             phaseEndDate: Date,
+            workoutEndDate: Date,
             pausedRemainingSeconds: Int,
-            totalRemainingSeconds: Int
+            totalRemainingSeconds: Int,
+            updateSequence: Int
         ) {
             self.phase = phase
             self.currentExercise = currentExercise
@@ -46,8 +50,10 @@ public struct PulseCoachActivityAttributes: ActivityAttributes {
             self.isPaused = isPaused
             self.phaseStartDate = phaseStartDate
             self.phaseEndDate = phaseEndDate
+            self.workoutEndDate = workoutEndDate
             self.pausedRemainingSeconds = pausedRemainingSeconds
             self.totalRemainingSeconds = totalRemainingSeconds
+            self.updateSequence = updateSequence
         }
 
         public var counterText: String {

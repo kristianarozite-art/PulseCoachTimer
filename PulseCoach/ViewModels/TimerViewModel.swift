@@ -35,6 +35,8 @@ public final class TimerViewModel {
     private var pausedRemainingInPhase: TimeInterval = 0
     private var spokenCountdownSeconds: Set<Int> = []
     private var lastKeepAliveCheckSecond: Int = -1
+    private var liveActivityUpdateSequence: Int = 0
+
     private var dispatchTimer: DispatchSourceTimer?
     private var runLoopTimer: Timer?
     private var pauseObserver: NSObjectProtocol?
@@ -106,6 +108,7 @@ public final class TimerViewModel {
         sessionExerciseCount = workout.exerciseCount
         totalExercises = workout.exerciseCount
         totalReps = workout.repsPerExercise
+        liveActivityUpdateSequence = 0
 
         phases = workout.buildPhases()
         isPaused = false
@@ -136,7 +139,7 @@ public final class TimerViewModel {
         isPaused = true
         stopBackgroundSafeTimer()
         triggerImpactHaptic(.medium)
-        syncLiveActivity(isPhaseTransition: false)
+        syncLiveActivity()
     }
 
     public func resumeWorkout() {
@@ -148,7 +151,7 @@ public final class TimerViewModel {
         isPaused = false
         triggerImpactHaptic(.light)
         startBackgroundSafeTimer()
-        syncLiveActivity(isPhaseTransition: true)
+        syncLiveActivity()
     }
 
     public func togglePauseFromLiveActivity() {
@@ -185,7 +188,7 @@ public final class TimerViewModel {
             spokenCountdownSeconds.removeAll()
         }
 
-        syncLiveActivity(isPhaseTransition: true)
+        syncLiveActivity()
     }
 
     // MARK: - Session-Only Adjustments While Paused
@@ -369,7 +372,7 @@ public final class TimerViewModel {
         phases = prefix + newUpcoming
         totalExercises = totalEx
         futurePhasesDuration = newUpcoming.reduce(0) { $0 + $1.duration }
-        syncLiveActivity(isPhaseTransition: false)
+        syncLiveActivity()
     }
 
     public func stopAndCleanup() {
@@ -443,6 +446,7 @@ public final class TimerViewModel {
         remainingTimeInPhase = max(0, phaseEndDate.timeIntervalSince(now))
 
         // Once per second, verify the background silent keep-alive loop is still active
+        // NOTE: We NEVER call LiveActivityManager.updateActivity here on 1-second ticks!
         let curSec = Int(ceil(remainingTimeInPhase))
         if curSec != lastKeepAliveCheckSecond {
             lastKeepAliveCheckSecond = curSec
@@ -478,8 +482,8 @@ public final class TimerViewModel {
         spokenCountdownSeconds.removeAll()
         lastKeepAliveCheckSecond = Int(ceil(remainingTimeInPhase))
 
-        // CRITICAL: Push Live Activity update FIRST (under UIBackgroundTaskIdentifier)
-        // before triggering audio session changes so iOS never delays or drops the Lock Screen update
+        // Increment discrete state sequence and push Live Activity update immediately
+        liveActivityUpdateSequence += 1
         let currentState = buildActivityState()
         if isInitialStart {
             LiveActivityManager.shared.startActivity(
@@ -487,10 +491,7 @@ public final class TimerViewModel {
                 state: currentState
             )
         } else {
-            LiveActivityManager.shared.updateActivity(
-                with: currentState,
-                isPhaseTransition: true
-            )
+            LiveActivityManager.shared.updateActivity(with: currentState)
         }
 
         AudioEngine.shared.playPhaseStartCue(for: step.type, workout: workout)
@@ -524,6 +525,7 @@ public final class TimerViewModel {
         remainingTimeInPhase = 0
         futurePhasesDuration = 0
 
+        liveActivityUpdateSequence += 1
         let finalState = buildActivityState()
         LiveActivityManager.shared.endActivity(finalState: finalState)
 
@@ -532,7 +534,8 @@ public final class TimerViewModel {
     }
 
     private func buildActivityState() -> PulseCoachActivityAttributes.ContentState {
-        PulseCoachActivityAttributes.ContentState(
+        let totalEnd = phaseEndDate.addingTimeInterval(max(0, futurePhasesDuration))
+        return PulseCoachActivityAttributes.ContentState(
             phase: currentPhaseType,
             currentExercise: currentExercise,
             totalExercises: totalExercises,
@@ -541,16 +544,16 @@ public final class TimerViewModel {
             isPaused: isPaused,
             phaseStartDate: phaseStartDate,
             phaseEndDate: phaseEndDate,
+            workoutEndDate: totalEnd,
             pausedRemainingSeconds: displaySeconds,
-            totalRemainingSeconds: totalRemainingSeconds
+            totalRemainingSeconds: totalRemainingSeconds,
+            updateSequence: liveActivityUpdateSequence
         )
     }
 
-    private func syncLiveActivity(isPhaseTransition: Bool) {
-        LiveActivityManager.shared.updateActivity(
-            with: buildActivityState(),
-            isPhaseTransition: isPhaseTransition
-        )
+    private func syncLiveActivity() {
+        liveActivityUpdateSequence += 1
+        LiveActivityManager.shared.updateActivity(with: buildActivityState())
     }
 
     private func setupLiveActivityObservers() {
@@ -582,7 +585,7 @@ public final class TimerViewModel {
             Task { @MainActor [weak self] in
                 guard let self, !self.isCompleted else { return }
                 self.handleTimerTick()
-                self.syncLiveActivity(isPhaseTransition: false)
+                self.syncLiveActivity()
             }
         }
     }
