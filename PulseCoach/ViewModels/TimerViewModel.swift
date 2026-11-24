@@ -34,9 +34,12 @@ public final class TimerViewModel {
     private var phaseEndDate: Date = Date()
     private var pausedRemainingInPhase: TimeInterval = 0
     private var spokenCountdownSeconds: Set<Int> = []
+    private var lastKeepAliveCheckSecond: Int = -1
     private var dispatchTimer: DispatchSourceTimer?
+    private var runLoopTimer: Timer?
     private var pauseObserver: NSObjectProtocol?
     private var addTenObserver: NSObjectProtocol?
+    private var foregroundObserver: NSObjectProtocol?
 
     public init(workout: Workout) {
         self.workout = workout
@@ -133,7 +136,7 @@ public final class TimerViewModel {
         isPaused = true
         stopBackgroundSafeTimer()
         triggerImpactHaptic(.medium)
-        syncLiveActivity()
+        syncLiveActivity(isPhaseTransition: false)
     }
 
     public func resumeWorkout() {
@@ -145,7 +148,7 @@ public final class TimerViewModel {
         isPaused = false
         triggerImpactHaptic(.light)
         startBackgroundSafeTimer()
-        syncLiveActivity()
+        syncLiveActivity(isPhaseTransition: true)
     }
 
     public func togglePauseFromLiveActivity() {
@@ -182,7 +185,7 @@ public final class TimerViewModel {
             spokenCountdownSeconds.removeAll()
         }
 
-        syncLiveActivity()
+        syncLiveActivity(isPhaseTransition: true)
     }
 
     // MARK: - Session-Only Adjustments While Paused
@@ -330,15 +333,12 @@ public final class TimerViewModel {
             }
 
         case .work:
-            // First, rest after the current work interval (if not the final rep of the final exercise)
             appendRestAfter(ex: currentExercise, rep: currentRep)
-            // Remaining reps of currentExercise
             if currentRep < repsCount {
                 for rep in (currentRep + 1)...repsCount {
                     appendWorkAndRest(ex: currentExercise, rep: rep)
                 }
             }
-            // Remaining exercises
             if currentExercise < totalEx {
                 for ex in (currentExercise + 1)...totalEx {
                     for rep in 1...repsCount {
@@ -348,13 +348,11 @@ public final class TimerViewModel {
             }
 
         case .rest, .transitionRest:
-            // Remaining reps of currentExercise
             if currentRep < repsCount {
                 for rep in (currentRep + 1)...repsCount {
                     appendWorkAndRest(ex: currentExercise, rep: rep)
                 }
             }
-            // Remaining exercises
             if currentExercise < totalEx {
                 for ex in (currentExercise + 1)...totalEx {
                     for rep in 1...repsCount {
@@ -367,12 +365,11 @@ public final class TimerViewModel {
             break
         }
 
-        // Update current phase's totalExercises metadata and replace tail of phases array
         let prefix = Array(phases[0...currentPhaseIndex])
         phases = prefix + newUpcoming
         totalExercises = totalEx
         futurePhasesDuration = newUpcoming.reduce(0) { $0 + $1.duration }
-        syncLiveActivity()
+        syncLiveActivity(isPhaseTransition: false)
     }
 
     public func stopAndCleanup() {
@@ -388,26 +385,43 @@ public final class TimerViewModel {
             NotificationCenter.default.removeObserver(observer)
             addTenObserver = nil
         }
+        if let observer = foregroundObserver {
+            NotificationCenter.default.removeObserver(observer)
+            foregroundObserver = nil
+        }
         AudioEngine.shared.stopWorkoutAudioSession()
         LiveActivityManager.shared.endActivity()
     }
 
-    // MARK: - Internal Phase & Timestamp Engine (DispatchSourceTimer for Lock Screen Reliability)
+    // MARK: - Internal Phase & Timestamp Engine (Dual DispatchSourceTimer + Common RunLoop Timer)
 
     private func startBackgroundSafeTimer() {
         stopBackgroundSafeTimer()
+
+        // 1. Strict DispatchSourceTimer on main queue
         let source = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
-        source.schedule(deadline: .now() + .milliseconds(40), repeating: .milliseconds(40), leeway: .milliseconds(5))
+        source.schedule(deadline: .now() + .milliseconds(45), repeating: .milliseconds(45), leeway: .milliseconds(5))
         source.setEventHandler { [weak self] in
             self?.handleTimerTick()
         }
         source.resume()
         dispatchTimer = source
+
+        // 2. Redundant RunLoop.main .common mode timer so background audio execution never stalls
+        let rlTimer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleTimerTick()
+            }
+        }
+        RunLoop.main.add(rlTimer, forMode: .common)
+        runLoopTimer = rlTimer
     }
 
     private func stopBackgroundSafeTimer() {
         dispatchTimer?.cancel()
         dispatchTimer = nil
+        runLoopTimer?.invalidate()
+        runLoopTimer = nil
     }
 
     private func handleTimerTick() {
@@ -427,6 +441,14 @@ public final class TimerViewModel {
         }
 
         remainingTimeInPhase = max(0, phaseEndDate.timeIntervalSince(now))
+
+        // Once per second, verify the background silent keep-alive loop is still active
+        let curSec = Int(ceil(remainingTimeInPhase))
+        if curSec != lastKeepAliveCheckSecond {
+            lastKeepAliveCheckSecond = curSec
+            AudioEngine.shared.ensureKeepAliveRunning()
+        }
+
         checkAndPlayCountdownTicks()
     }
 
@@ -454,11 +476,10 @@ public final class TimerViewModel {
         phaseEndDate = effectiveStart.addingTimeInterval(step.duration)
         remainingTimeInPhase = max(0, phaseEndDate.timeIntervalSince(now))
         spokenCountdownSeconds.removeAll()
+        lastKeepAliveCheckSecond = Int(ceil(remainingTimeInPhase))
 
-        AudioEngine.shared.playPhaseStartCue(for: step.type, workout: workout)
-        triggerPhaseHaptic(for: step.type)
-
-        // Immediately push state update to LiveActivityManager from ViewModel (works even when screen is locked)
+        // CRITICAL: Push Live Activity update FIRST (under UIBackgroundTaskIdentifier)
+        // before triggering audio session changes so iOS never delays or drops the Lock Screen update
         let currentState = buildActivityState()
         if isInitialStart {
             LiveActivityManager.shared.startActivity(
@@ -466,8 +487,14 @@ public final class TimerViewModel {
                 state: currentState
             )
         } else {
-            LiveActivityManager.shared.updateActivity(with: currentState)
+            LiveActivityManager.shared.updateActivity(
+                with: currentState,
+                isPhaseTransition: true
+            )
         }
+
+        AudioEngine.shared.playPhaseStartCue(for: step.type, workout: workout)
+        triggerPhaseHaptic(for: step.type)
     }
 
     private func checkAndPlayCountdownTicks() {
@@ -477,7 +504,6 @@ public final class TimerViewModel {
         let ceilSec = Int(ceil(remainingTimeInPhase))
         guard (1...3).contains(ceilSec) else { return }
 
-        // Avoid overlapping with the phase start cue at the exact start of Work/Rest
         let totalWholeSeconds = Int(round(currentPhaseTotalDuration))
         if currentPhaseType != .getReady && ceilSec >= totalWholeSeconds {
             return
@@ -498,11 +524,11 @@ public final class TimerViewModel {
         remainingTimeInPhase = 0
         futurePhasesDuration = 0
 
-        AudioEngine.shared.playPhaseStartCue(for: .done, workout: workout)
-        triggerPhaseHaptic(for: .done)
-
         let finalState = buildActivityState()
         LiveActivityManager.shared.endActivity(finalState: finalState)
+
+        AudioEngine.shared.playPhaseStartCue(for: .done, workout: workout)
+        triggerPhaseHaptic(for: .done)
     }
 
     private func buildActivityState() -> PulseCoachActivityAttributes.ContentState {
@@ -520,8 +546,11 @@ public final class TimerViewModel {
         )
     }
 
-    private func syncLiveActivity() {
-        LiveActivityManager.shared.updateActivity(with: buildActivityState())
+    private func syncLiveActivity(isPhaseTransition: Bool) {
+        LiveActivityManager.shared.updateActivity(
+            with: buildActivityState(),
+            isPhaseTransition: isPhaseTransition
+        )
     }
 
     private func setupLiveActivityObservers() {
@@ -542,6 +571,18 @@ public final class TimerViewModel {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.addTenSecondsToRest()
+            }
+        }
+
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isCompleted else { return }
+                self.handleTimerTick()
+                self.syncLiveActivity(isPhaseTransition: false)
             }
         }
     }

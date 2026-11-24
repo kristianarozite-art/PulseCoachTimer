@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import AudioToolbox
+import UIKit
 
 @MainActor
 public final class AudioEngine: NSObject {
@@ -9,6 +10,7 @@ public final class AudioEngine: NSObject {
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var keepAlivePlayer: AVAudioPlayer?
     private var activeCuePlayers: [AVAudioPlayer] = []
+    private var countdownPlayers: Set<ObjectIdentifier> = []
     private var duckRestoreTask: Task<Void, Never>?
     private var isWorkoutSessionActive: Bool = false
     private var isCurrentlyDucking: Bool = false
@@ -34,6 +36,17 @@ public final class AudioEngine: NSObject {
         startKeepAliveLoop()
     }
 
+    public func ensureKeepAliveRunning() {
+        guard isWorkoutSessionActive else { return }
+        if let player = keepAlivePlayer {
+            if !player.isPlaying {
+                player.play()
+            }
+        } else {
+            startKeepAliveLoop()
+        }
+    }
+
     public func stopWorkoutAudioSession() {
         isWorkoutSessionActive = false
         isCurrentlyDucking = false
@@ -47,6 +60,7 @@ public final class AudioEngine: NSObject {
             player.stop()
         }
         activeCuePlayers.removeAll()
+        countdownPlayers.removeAll()
 
         if speechSynthesizer.isSpeaking {
             speechSynthesizer.stopSpeaking(at: .immediate)
@@ -69,7 +83,7 @@ public final class AudioEngine: NSObject {
         }
     }
 
-    private func activateDuckingBeforeCue(fallbackDuration: TimeInterval) {
+    private func activateDuckingBeforeCue(fallbackDuration: TimeInterval, isCountdownTick: Bool) {
         duckRestoreTask?.cancel()
         duckRestoreTask = nil
 
@@ -80,24 +94,27 @@ public final class AudioEngine: NSObject {
             return
         }
 
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playback, mode: .default, options: [.duckOthers])
-            try session.setActive(true)
-            isCurrentlyDucking = true
-        } catch {
-            print("[AudioEngine] Failed to activate ducking: \(error.localizedDescription)")
+        if !isCurrentlyDucking {
+            let session = AVAudioSession.sharedInstance()
+            do {
+                try session.setCategory(.playback, mode: .default, options: [.duckOthers])
+                try session.setActive(true)
+                isCurrentlyDucking = true
+            } catch {
+                print("[AudioEngine] Failed to activate ducking: \(error.localizedDescription)")
+            }
         }
 
-        // Safety fallback timer in case delegate callback doesn't fire
-        scheduleDuckRestore(after: fallbackDuration + 0.35)
+        // For 3-2-1 countdown ticks, hold ducking for 1.45s so we never unduck right at the 0:00 phase boundary
+        let safetyDelay = isCountdownTick ? max(1.45, fallbackDuration + 0.8) : (fallbackDuration + 0.35)
+        scheduleDuckRestore(after: safetyDelay)
     }
 
     private func scheduleDuckRestore(after delaySeconds: TimeInterval) {
         guard currentSpotifyBehavior == .duck else { return }
         duckRestoreTask?.cancel()
         duckRestoreTask = Task { @MainActor [weak self] in
-            let ns = UInt64(max(0.05, delaySeconds) * 1_000_000_000)
+            let ns = UInt64(max(0.08, delaySeconds) * 1_000_000_000)
             try? await Task.sleep(nanoseconds: ns)
             guard let self, !Task.isCancelled else { return }
             // Only unduck if no cue is still actively playing
@@ -112,6 +129,21 @@ public final class AudioEngine: NSObject {
         guard isCurrentlyDucking else { return }
         isCurrentlyDucking = false
 
+        // Protect the brief session deactivation with a background task assertion
+        // so iOS never suspends the background timer while keepAlivePlayer is paused for 1ms
+        var bgTask: UIBackgroundTaskIdentifier = .invalid
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "PulseCoach.AudioSessionUnduck") {
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+                bgTask = .invalid
+            }
+        }
+        defer {
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+            }
+        }
+
         let session = AVAudioSession.sharedInstance()
         do {
             // 1. Briefly pause silent keep-alive player so setActive(false) succeeds cleanly
@@ -121,7 +153,7 @@ public final class AudioEngine: NSObject {
             // 2. Deactivate with .notifyOthersOnDeactivation so Spotify immediately returns to 100% volume
             try session.setActive(false, options: [.notifyOthersOnDeactivation])
 
-            // 3. Restore .mixWithOthers category and reactivate session for background keep-alive
+            // 3. Immediately restore .mixWithOthers category and reactivate session for background keep-alive
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             if isWorkoutSessionActive {
                 try session.setActive(true)
@@ -135,7 +167,7 @@ public final class AudioEngine: NSObject {
             print("[AudioEngine] Restore after duck error: \(error.localizedDescription)")
             if isWorkoutSessionActive {
                 configureMixAudioSession()
-                keepAlivePlayer?.play()
+                ensureKeepAliveRunning()
             }
         }
     }
@@ -219,14 +251,35 @@ public final class AudioEngine: NSObject {
                 return
             }
 
-            if !playBundledAudioIfExists(named: resourceName, volume: volume, estimatedDuration: 0.45) {
-                speakFallback(text: fallbackText, volume: volume, rate: 0.58, estimatedDuration: 0.45)
+            if !playBundledAudioIfExists(
+                named: resourceName,
+                volume: volume,
+                estimatedDuration: 0.45,
+                isCountdownTick: true
+            ) {
+                speakFallback(
+                    text: fallbackText,
+                    volume: volume,
+                    rate: 0.58,
+                    estimatedDuration: 0.45,
+                    isCountdownTick: true
+                )
             }
 
         case .soundEffects:
             // Short countdown beeps (NEVER spoken words when Sound Effects is selected)
-            if !playBundledAudioIfExists(named: "sfx_countdown_beep", volume: volume, estimatedDuration: 0.16) {
-                playSynthesizedSFX(key: "sfx_countdown_beep", volume: volume, estimatedDuration: 0.16)
+            if !playBundledAudioIfExists(
+                named: "sfx_countdown_beep",
+                volume: volume,
+                estimatedDuration: 0.16,
+                isCountdownTick: true
+            ) {
+                playSynthesizedSFX(
+                    key: "sfx_countdown_beep",
+                    volume: volume,
+                    estimatedDuration: 0.16,
+                    isCountdownTick: true
+                )
             }
         }
     }
@@ -241,21 +294,52 @@ public final class AudioEngine: NSObject {
         switch phase {
         case .getReady:
             if workout.cueType == .soundEffects {
-                if !playBundledAudioIfExists(named: "sfx_countdown_beep", volume: volume * 0.85, estimatedDuration: 0.16) {
-                    playSynthesizedSFX(key: "sfx_countdown_beep", volume: volume * 0.85, estimatedDuration: 0.16)
+                if !playBundledAudioIfExists(
+                    named: "sfx_countdown_beep",
+                    volume: volume * 0.85,
+                    estimatedDuration: 0.16,
+                    isCountdownTick: false
+                ) {
+                    playSynthesizedSFX(
+                        key: "sfx_countdown_beep",
+                        volume: volume * 0.85,
+                        estimatedDuration: 0.16,
+                        isCountdownTick: false
+                    )
                 }
             }
 
         case .work:
             switch workout.cueType {
             case .studioVoice:
-                if !playBundledAudioIfExists(named: "voice_work", volume: volume, estimatedDuration: 0.65) {
-                    speakFallback(text: "Work", volume: volume, rate: 0.56, estimatedDuration: 0.65)
+                if !playBundledAudioIfExists(
+                    named: "voice_work",
+                    volume: volume,
+                    estimatedDuration: 0.65,
+                    isCountdownTick: false
+                ) {
+                    speakFallback(
+                        text: "Work",
+                        volume: volume,
+                        rate: 0.56,
+                        estimatedDuration: 0.65,
+                        isCountdownTick: false
+                    )
                 }
             case .soundEffects:
                 let resource = workout.soundEffectStyle.workSoundResourceName
-                if !playBundledAudioIfExists(named: resource, volume: volume, estimatedDuration: 0.70) {
-                    playSynthesizedSFX(key: resource, volume: volume, estimatedDuration: 0.70)
+                if !playBundledAudioIfExists(
+                    named: resource,
+                    volume: volume,
+                    estimatedDuration: 0.70,
+                    isCountdownTick: false
+                ) {
+                    playSynthesizedSFX(
+                        key: resource,
+                        volume: volume,
+                        estimatedDuration: 0.70,
+                        isCountdownTick: false
+                    )
                 }
             }
 
@@ -263,25 +347,67 @@ public final class AudioEngine: NSObject {
             // Single cue at the start of standard or transition rest
             switch workout.cueType {
             case .studioVoice:
-                if !playBundledAudioIfExists(named: "voice_rest", volume: volume, estimatedDuration: 0.65) {
-                    speakFallback(text: "Rest", volume: volume, rate: 0.54, estimatedDuration: 0.65)
+                if !playBundledAudioIfExists(
+                    named: "voice_rest",
+                    volume: volume,
+                    estimatedDuration: 0.65,
+                    isCountdownTick: false
+                ) {
+                    speakFallback(
+                        text: "Rest",
+                        volume: volume,
+                        rate: 0.54,
+                        estimatedDuration: 0.65,
+                        isCountdownTick: false
+                    )
                 }
             case .soundEffects:
                 let resource = workout.soundEffectStyle.restSoundResourceName
-                if !playBundledAudioIfExists(named: resource, volume: volume, estimatedDuration: 0.70) {
-                    playSynthesizedSFX(key: resource, volume: volume, estimatedDuration: 0.70)
+                if !playBundledAudioIfExists(
+                    named: resource,
+                    volume: volume,
+                    estimatedDuration: 0.70,
+                    isCountdownTick: false
+                ) {
+                    playSynthesizedSFX(
+                        key: resource,
+                        volume: volume,
+                        estimatedDuration: 0.70,
+                        isCountdownTick: false
+                    )
                 }
             }
 
         case .done:
             switch workout.cueType {
             case .studioVoice:
-                if !playBundledAudioIfExists(named: "voice_done", volume: volume, estimatedDuration: 1.25) {
-                    speakFallback(text: "Workout complete", volume: volume, rate: 0.52, estimatedDuration: 1.25)
+                if !playBundledAudioIfExists(
+                    named: "voice_done",
+                    volume: volume,
+                    estimatedDuration: 1.25,
+                    isCountdownTick: false
+                ) {
+                    speakFallback(
+                        text: "Workout complete",
+                        volume: volume,
+                        rate: 0.52,
+                        estimatedDuration: 1.25,
+                        isCountdownTick: false
+                    )
                 }
             case .soundEffects:
-                if !playBundledAudioIfExists(named: "voice_done", volume: volume, estimatedDuration: 1.1) {
-                    playSynthesizedSFX(key: "sfx_done_fanfare", volume: volume, estimatedDuration: 1.1)
+                if !playBundledAudioIfExists(
+                    named: "voice_done",
+                    volume: volume,
+                    estimatedDuration: 1.1,
+                    isCountdownTick: false
+                ) {
+                    playSynthesizedSFX(
+                        key: "sfx_done_fanfare",
+                        volume: volume,
+                        estimatedDuration: 1.1,
+                        isCountdownTick: false
+                    )
                 }
             }
         }
@@ -308,7 +434,12 @@ public final class AudioEngine: NSObject {
         return nil
     }
 
-    private func playBundledAudioIfExists(named name: String, volume: Float, estimatedDuration: TimeInterval) -> Bool {
+    private func playBundledAudioIfExists(
+        named name: String,
+        volume: Float,
+        estimatedDuration: TimeInterval,
+        isCountdownTick: Bool
+    ) -> Bool {
         guard let url = locateBundledSoundURL(named: name) else {
             return false
         }
@@ -317,7 +448,10 @@ public final class AudioEngine: NSObject {
             let player = try AVAudioPlayer(contentsOf: url)
             guard player.duration > 0.02 else { return false }
             activeCuePlayers.removeAll { !$0.isPlaying }
-            activateDuckingBeforeCue(fallbackDuration: player.duration)
+            if isCountdownTick {
+                countdownPlayers.insert(ObjectIdentifier(player))
+            }
+            activateDuckingBeforeCue(fallbackDuration: player.duration, isCountdownTick: isCountdownTick)
             player.delegate = self
             player.volume = volume
             player.prepareToPlay()
@@ -330,9 +464,14 @@ public final class AudioEngine: NSObject {
         }
     }
 
-    private func speakFallback(text: String, volume: Float, rate: Float, estimatedDuration: TimeInterval) {
-        activateDuckingBeforeCue(fallbackDuration: estimatedDuration)
-        // Do NOT call stopSpeaking(at: .immediate) synchronously before speak(), as iOS 17 drops the new utterance
+    private func speakFallback(
+        text: String,
+        volume: Float,
+        rate: Float,
+        estimatedDuration: TimeInterval,
+        isCountdownTick: Bool
+    ) {
+        activateDuckingBeforeCue(fallbackDuration: estimatedDuration, isCountdownTick: isCountdownTick)
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
         utterance.volume = volume
@@ -343,7 +482,12 @@ public final class AudioEngine: NSObject {
         speechSynthesizer.speak(utterance)
     }
 
-    private func playSynthesizedSFX(key: String, volume: Float, estimatedDuration: TimeInterval) {
+    private func playSynthesizedSFX(
+        key: String,
+        volume: Float,
+        estimatedDuration: TimeInterval,
+        isCountdownTick: Bool
+    ) {
         guard let wavData = synthesizedToneCache[key] else {
             AudioServicesPlaySystemSound(1057)
             return
@@ -351,7 +495,10 @@ public final class AudioEngine: NSObject {
         do {
             activeCuePlayers.removeAll { !$0.isPlaying }
             let player = try AVAudioPlayer(data: wavData, fileTypeHint: AVFileType.wav.rawValue)
-            activateDuckingBeforeCue(fallbackDuration: max(estimatedDuration, player.duration))
+            if isCountdownTick {
+                countdownPlayers.insert(ObjectIdentifier(player))
+            }
+            activateDuckingBeforeCue(fallbackDuration: max(estimatedDuration, player.duration), isCountdownTick: isCountdownTick)
             player.delegate = self
             player.volume = volume
             player.prepareToPlay()
@@ -365,14 +512,12 @@ public final class AudioEngine: NSObject {
     // MARK: - Studio-Quality Synthesized Tone Generator (Fallback SFX)
 
     private func prewarmSynthesizedTones() {
-        // Countdown short beep (crisp, punchy 987.77 Hz B5 120ms studio timer pip)
         synthesizedToneCache["sfx_countdown_beep"] = Self.generateToneWav(
             segments: [
                 (freq: 987.77, duration: 0.12, harmonics: [1.0, 0.45, 0.2], decay: 6.5)
             ]
         )
 
-        // 1. Beep (High punchy double-beep + long high tone for Work, warm lower tone for Rest)
         synthesizedToneCache["sfx_beep_work"] = Self.generateToneWav(
             segments: [
                 (freq: 1318.5, duration: 0.11, harmonics: [1.0, 0.45, 0.2], decay: 5.0),
@@ -388,7 +533,6 @@ public final class AudioEngine: NSObject {
             ]
         )
 
-        // 2. Whistle (Bright referee whistle modulation for Work, short double-whistle for Rest)
         synthesizedToneCache["sfx_whistle_work"] = Self.generateToneWav(
             segments: [
                 (freq: 2650.0, duration: 0.42, harmonics: [1.0, 0.4, 0.15], decay: 3.5)
@@ -406,7 +550,6 @@ public final class AudioEngine: NSObject {
             vibratoDepth: 45.0
         )
 
-        // 3. Ring (Boxing bell metallic ring for Work & Rest)
         synthesizedToneCache["sfx_ring_work"] = Self.generateToneWav(
             segments: [
                 (freq: 1174.66, duration: 0.65, harmonics: [1.0, 0.75, 0.5, 0.35], decay: 4.2)
@@ -420,7 +563,6 @@ public final class AudioEngine: NSObject {
             ]
         )
 
-        // 4. Gong (Deep resonant studio gong for Work, warm low gong for Rest)
         synthesizedToneCache["sfx_gong_work"] = Self.generateToneWav(
             segments: [
                 (freq: 293.66, duration: 0.85, harmonics: [1.0, 0.85, 0.6, 0.4, 0.25], decay: 2.8)
@@ -432,7 +574,6 @@ public final class AudioEngine: NSObject {
             ]
         )
 
-        // 5. Calm Chime (Ascending harmonic chime for Work, descending warm chime for Rest)
         synthesizedToneCache["sfx_chime_work"] = Self.generateToneWav(
             segments: [
                 (freq: 587.33, duration: 0.20, harmonics: [1.0, 0.4, 0.15], decay: 4.0),
@@ -446,7 +587,6 @@ public final class AudioEngine: NSObject {
             ]
         )
 
-        // Done fanfare
         synthesizedToneCache["sfx_done_fanfare"] = Self.generateToneWav(
             segments: [
                 (freq: 523.25, duration: 0.16, harmonics: [1.0, 0.4], decay: 4.5),
@@ -555,11 +695,16 @@ public final class AudioEngine: NSObject {
 
 extension AudioEngine: AVAudioPlayerDelegate, AVSpeechSynthesizerDelegate {
     nonisolated public func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        let playerID = ObjectIdentifier(player)
         Task { @MainActor [weak self] in
             guard let self else { return }
+            let wasCountdown = self.countdownPlayers.remove(playerID) != nil
             self.activeCuePlayers.removeAll { $0 === player || !$0.isPlaying }
             if self.currentSpotifyBehavior == .duck {
-                self.scheduleDuckRestore(after: 0.12)
+                // For 3-2-1 countdown clips, keep ducking bridged to the next second/phase start
+                // so we never deactivate AVAudioSession at the 0:00 phase boundary!
+                let restoreDelay: TimeInterval = wasCountdown ? 0.65 : 0.12
+                self.scheduleDuckRestore(after: restoreDelay)
             }
         }
     }
@@ -568,7 +713,7 @@ extension AudioEngine: AVAudioPlayerDelegate, AVSpeechSynthesizerDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             if self.currentSpotifyBehavior == .duck {
-                self.scheduleDuckRestore(after: 0.12)
+                self.scheduleDuckRestore(after: 0.25)
             }
         }
     }

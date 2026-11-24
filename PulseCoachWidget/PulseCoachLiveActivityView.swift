@@ -200,6 +200,7 @@ private func liveTimerText(
             timerInterval: state.phaseStartDate...state.phaseEndDate,
             countsDown: true
         )
+        .id("\(state.phase.rawValue)-\(Int(state.phaseStartDate.timeIntervalSince1970))-\(Int(state.phaseEndDate.timeIntervalSince1970))")
         .font(.system(size: fontSize, weight: .black, design: .default))
         .monospacedDigit()
         .lineLimit(1)
